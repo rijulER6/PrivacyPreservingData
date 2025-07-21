@@ -1,0 +1,192 @@
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.20;
+
+import "@openzeppelin/contracts/access/Ownable.sol";
+
+contract PrivacyPreservingData is Ownable {
+    // Struct for Data Record
+    struct DataRecord {
+        uint256 id;
+        string dataHash; // IPFS hash of encrypted data
+        address owner; // Data owner (e.g., patient)
+        uint256 timestamp; // Unix timestamp
+        bool isActive;
+    }
+
+    // Struct for Access Permission
+    struct AccessPermission {
+        address authorizedUser; // e.g., doctor
+        bool canRead;
+        bool canWrite;
+        uint256 expiry; // Unix timestamp for access expiration
+    }
+
+    // Counters
+    uint256 private nextRecordId = 1;
+
+    // Mappings
+    mapping(uint256 => DataRecord) public records;
+    mapping(uint256 => AccessPermission[]) public permissions;
+    mapping(address => bool) public authorizedAdmins;
+
+    // Events
+    event DataRecordCreated(uint256 indexed recordId, address owner, string dataHash);
+    event AccessGranted(uint256 indexed recordId, address authorizedUser, bool canRead, bool canWrite, uint256 expiry);
+    event AccessRevoked(uint256 indexed recordId, address authorizedUser);
+    event AdminAuthorized(address indexed admin);
+    event AdminRevoked(address indexed admin);
+
+    constructor() Ownable(msg.sender) {}
+
+    // Modifier to restrict access to authorized admins or owner
+    modifier onlyAuthorizedAdmin() {
+        require(authorizedAdmins[msg.sender] || owner() == msg.sender, "Not authorized admin");
+        _;
+    }
+
+    // Modifier to check if user has read access
+    modifier onlyAuthorizedReader(uint256 recordId) {
+        require(hasReadAccess(recordId, msg.sender), "No read access");
+        _;
+    }
+
+    // Authorize an admin
+    function authorizeAdmin(address admin) external onlyOwner {
+        require(admin != address(0), "Invalid address");
+        authorizedAdmins[admin] = true;
+        emit AdminAuthorized(admin);
+    }
+
+    // Revoke an admin
+    function revokeAdmin(address admin) external onlyOwner {
+        require(authorizedAdmins[admin], "Admin not authorized");
+        authorizedAdmins[admin] = false;
+        emit AdminRevoked(admin);
+    }
+
+    // Create a new data record (e.g., encrypted medical record)
+    function createDataRecord(string memory dataHash) external returns (uint256) {
+        require(bytes(dataHash).length > 0, "Data hash cannot be empty");
+
+        uint256 recordId = nextRecordId++;
+        records[recordId] = DataRecord(recordId, dataHash, msg.sender, block.timestamp, true);
+        emit DataRecordCreated(recordId, msg.sender, dataHash);
+        return recordId;
+    }
+
+    // Grant access to a user
+    function grantAccess(
+        uint256 recordId,
+        address user,
+        bool canRead,
+        bool canWrite,
+        uint256 expiry
+    ) external {
+        require(records[recordId].isActive, "Record not active");
+        require(records[recordId].owner == msg.sender, "Only record owner can grant access");
+        require(user != address(0), "Invalid user address");
+        require(expiry > block.timestamp, "Expiry must be in the future");
+
+        permissions[recordId].push(AccessPermission(user, canRead, canWrite, expiry));
+        emit AccessGranted(recordId, user, canRead, canWrite, expiry);
+    }
+
+    // Revoke access for a user
+    function revokeAccess(uint256 recordId, address user) external {
+        require(records[recordId].isActive, "Record not active");
+        require(records[recordId].owner == msg.sender || authorizedAdmins[msg.sender], "Not authorized");
+
+        for (uint256 i = 0; i < permissions[recordId].length; i++) {
+            if (permissions[recordId][i].authorizedUser == user) {
+                permissions[recordId][i] = permissions[recordId][permissions[recordId].length - 1];
+                permissions[recordId].pop();
+                emit AccessRevoked(recordId, user);
+                break;
+            }
+        }
+    }
+
+    // Update data record (only owner or authorized writer)
+    function updateDataRecord(uint256 recordId, string memory newDataHash) external {
+        require(records[recordId].isActive, "Record not active");
+        require(bytes(newDataHash).length > 0, "Data hash cannot be empty");
+        require(
+            records[recordId].owner == msg.sender || hasWriteAccess(recordId, msg.sender),
+            "No write access"
+        );
+
+        records[recordId].dataHash = newDataHash;
+        records[recordId].timestamp = block.timestamp;
+        emit DataRecordCreated(recordId, records[recordId].owner, newDataHash);
+    }
+
+    // Get data record details (only owner or authorized reader)
+    function getDataRecord(uint256 recordId)
+        external
+        view
+        onlyAuthorizedReader(recordId)
+        returns (string memory dataHash, address owner, uint256 timestamp)
+    {
+        require(records[recordId].isActive, "Record not active");
+        DataRecord memory record = records[recordId];
+        return (record.dataHash, record.owner, record.timestamp);
+    }
+
+    // Get access permissions for a record
+    function getPermissions(uint256 recordId)
+        external
+        view
+        returns (AccessPermission[] memory)
+    {
+        require(records[recordId].isActive, "Record not active");
+        require(
+            records[recordId].owner == msg.sender || authorizedAdmins[msg.sender],
+            "Not authorized"
+        );
+        return permissions[recordId];
+    }
+
+    // Check if a user has read access
+    function hasReadAccess(uint256 recordId, address user) public view returns (bool) {
+        if (records[recordId].owner == user || authorizedAdmins[user]) {
+            return true;
+        }
+        for (uint256 i = 0; i < permissions[recordId].length; i++) {
+            if (
+                permissions[recordId][i].authorizedUser == user &&
+                permissions[recordId][i].canRead &&
+                permissions[recordId][i].expiry > block.timestamp
+            ) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    // Check if a user has write access
+    function hasWriteAccess(uint256 recordId, address user) public view returns (bool) {
+        if (records[recordId].owner == user || authorizedAdmins[user]) {
+            return true;
+        }
+        for (uint256 i = 0; i < permissions[recordId].length; i++) {
+            if (
+                permissions[recordId][i].authorizedUser == user &&
+                permissions[recordId][i].canWrite &&
+                permissions[recordId][i].expiry > block.timestamp
+            ) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    // Deactivate a record (only owner or admin)
+    function deactivateRecord(uint256 recordId) external {
+        require(records[recordId].isActive, "Record not active");
+        require(
+            records[recordId].owner == msg.sender || authorizedAdmins[msg.sender],
+            "Not authorized"
+        );
+        records[recordId].isActive = false;
+    }
+}
